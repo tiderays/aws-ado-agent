@@ -1,2 +1,2 @@
 # aws-ado-agent
-Deploy a Azure Devops Pipeline Agent in on AWS EC2
+Deploy an Azure Devops Pipeline Agent in on AWS EC2
