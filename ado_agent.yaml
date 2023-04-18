@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Self-hosted ADO Pipeline Agent
+Parameters:
+  ADMIN:
+    Type: String
+    Description: Admin Role ARN - This is a Role ARN you use in your AWS account for admin things
+    Default: arn:aws:iam::12345678912:role/MyAdminRole
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: VPC ID
+  SubnetId1:
+    Type: 'AWS::EC2::Subnet::Id'
+    Description: Private Subnet 1
+  SubnetId2:
+    Type: 'AWS::EC2::Subnet::Id'
+    Description: Private Subnet 2
+  ImageId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: Latest Amazon Linux 2 AMI - Grabbed from Amazon SSM params
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  InstanceType:
+    Type: String
+    Description: Instance Size
+    Default: t3.small
+  Owner:
+    Type: String
+    Description: Owner
+    Default: First-Last-SE
+  VSTSAgentVersion:
+    Type: String
+    Description: VSTS Agent Version
+    Default: 2.218.1
+  VSTSAgentPool:
+    Type: String
+    Description: VSTS Agent Pool Name
+  VSTSAgentName:
+    Type: String
+    Description: VSTS Agent Name
+  ADOURL:
+    Type: String
+    Description: Your ADO Organization URL
+  PythonVersion:
+    Type: String
+    Description: Python Version
+    Default: 3.11.2
+  ASGTZ:
+    Type: String
+    Description: Timezone for ASG
+    Default: "America/New_York"
+  ScaleOut:
+    Type: String
+    Description: Crontab for scale out. This default is Monday-Friday 8:30AM of your selected timezone
+    Default: "30 8 * * 1,2,3,4,5"
+  ScaleIn:
+    Type: String
+    Description: Crontab for scale in. This default is everday 5:30PM of your selected timezone
+    Default: "30 17 * * *"
+  ADOPATSECRET:
+    Type: String
+    Description: ADO PAT Secret Name
+    Default: /ado/pat
+  ADOAgentRoleName:
+    Type: String
+    Description: ADO Agent Role Name
+    Default: ADOAgent
+
+Resources:
+  ADORole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref ADOAgentRoleName
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+      Policies:
+        - PolicyName: MinimalSSMandCloudWatch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:UpdateInstanceInformation'
+                  - 'ssmmessages:CreateControlChannel'
+                  - 'ssmmessages:CreateDataChannel'
+                  - 'ssmmessages:OpenControlChannel'
+                  - 'ssmmessages:OpenDataChannel'
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+
+        - PolicyName: GetADOPAT
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ADOPATSECRET}-*'
+
+  ADOAgentInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    DependsOn: ADORole
+    Properties:
+      InstanceProfileName: !Ref ADOAgentRoleName
+      Roles:
+        - Ref: ADORole
+
+  ADOAgentASG:
+    DependsOn: 
+      - ADOPATSECRETSECRET
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AutoScalingGroupName: ADOAgentASG
+      VPCZoneIdentifier:
+        -
+          Ref: SubnetId1
+        -
+          Ref: SubnetId2
+      LaunchConfigurationName: !Ref ADOAgentLC
+      MaxSize: '1'
+      MinSize: '1'
+      DesiredCapacity: '1'
+      Cooldown: '10'
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: '300'
+      Tags:
+          -
+            Key: Name
+            Value: ado-pipeline-agent
+            PropagateAtLaunch: 'true'
+          -
+            Key: Owner
+            Value:
+              Ref: Owner
+            PropagateAtLaunch: 'true'
+
+  ScheduledActionOut: 
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref ADOAgentASG
+      MaxSize: '1'
+      MinSize: '1'
+      TimeZone: !Ref ASGTZ
+      Recurrence: !Ref ScaleOut
+
+  ScheduledActionIn: 
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref ADOAgentASG
+      MaxSize: '0'
+      MinSize: '0'
+      TimeZone: !Ref ASGTZ
+      Recurrence: !Ref ScaleIn
+
+  ADOAgentLC:
+      Type: 'AWS::AutoScaling::LaunchConfiguration'
+      Properties:
+        IamInstanceProfile: !Ref ADOAgentInstanceProfile
+        ImageId: !Ref ImageId
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              |
+                #!/bin/bash
+                AGENT_DIR="/opt/vsts-agent"
+
+                # Python Install
+                yum update -y
+                yum groupinstall "Development Tools" -y
+                yum erase openssl-devel -y
+                yum install openssl11 openssl11-devel libffi-devel bzip2-devel wget -y
+                cd /opt
+                wget https://www.python.org/ftp/python/${PythonVersion}/Python-${PythonVersion}.tgz
+                tar -xf Python-${PythonVersion}.tgz
+                cd Python-${PythonVersion}/
+                ./configure --enable-optimizations --prefix=/usr
+                make -j $(nproc)
+                make altinstall
+                yum groupremove "Development Tools" -y
+
+                # Install Terraform
+                yum install -y yum-utils git jq
+                yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+                yum -y install terraform
+
+                mkdir $AGENT_DIR
+                chown -R ec2-user:ec2-user $AGENT_DIR
+                cd $AGENT_DIR
+
+                # Install Azure DevOps Agent
+                wget https://vstsagentpackage.azureedge.net/agent/${VSTSAgentVersion}/vsts-agent-linux-x64-${VSTSAgentVersion}.tar.gz
+                tar zxvf vsts-agent-linux-x64-${VSTSAgentVersion}.tar.gz
+                chown ec2-user . -R
+
+                # Setup .aws config 
+                mkdir /home/ec2-user/.aws
+                echo "[default]" > /home/ec2-user/.aws/config
+                echo "output = json" >> /home/ec2-user/.aws/config
+                echo "region = us-east-1" >> /home/ec2-user/.aws/config
+                chown ec2-user:ec2-user /home/ec2-user/.aws/config
+
+                echo 'Fetching PAT from Secrets Manager'
+                pat_token=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${ADOPATSECRET} --output text | awk '{ print $4 }' | cut -d: -f2 | tr -d \"})
+
+                echo 'Installing Azure DevOps Agent'
+                su ec2-user -c "sh config.sh --unattended --url ${ADOURL} --auth pat --token $pat_token --pool ${VSTSAgentPool} --agent ${VSTSAgentName} --replace True --acceptTeeEula True"
+                unset pat_token
+                sudo ./svc.sh install ec2-user
+                sudo ./svc.sh start
+
+        InstanceMonitoring: 'False'
+        AssociatePublicIpAddress: 'False'
+        InstanceType:
+          !Ref InstanceType
+        BlockDeviceMappings: 
+          - DeviceName: /dev/xvda
+            Ebs: 
+              VolumeSize: '8'
+              VolumeType: gp3
+        SecurityGroups:
+          -
+            !Ref ADOAgentSG
+
+  ADOAgentSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+      VpcId: !Ref VpcId
+      GroupName: ADOAgent
+      GroupDescription: ADO Pipeline Agent
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: ICMP from anywhere
+
+# Secret & Resource Policy
+  ADOPATSECRETSECRET:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref ADOPATSECRET
+      Description: "ADO PAT"
+      SecretString: '{"ADO_PAT":""}'
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+  ADOPATSECRETResourcePolicy:
+    DependsOn:
+      - ADORole
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref ADOPATSECRET
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Principal:
+              AWS: !Ref ADMIN
+            Effect: "Allow"
+            Action: 
+              - 'secretsmanager:CreateSecret'
+              - 'secretsmanager:DeleteResourcePolicy'
+              - 'secretsmanager:DeleteSecret'
+              - 'secretsmanager:DescribeSecret'
+              - 'secretsmanager:GetResourcePolicy'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:List*'
+              - 'secretsmanager:PutResourcePolicy'
+              - 'secretsmanager:PutSecretValue'
+              - 'secretsmanager:RestoreSecret'
+              - 'secretsmanager:UpdateSecret*'
+              - 'secretsmanager:ValidateResourcePolicy'
+            Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ADOPATSECRET}-*
+            Condition:
+              StringEquals:
+                'secretsmanager:ResourceTag/Owner': !Ref Owner
+          -
+            Principal:
+              AWS: !GetAtt ADORole.Arn
+            Effect: "Allow"
+            Action: 
+              - 'secretsmanager:CreateSecret'
+              - 'secretsmanager:DeleteResourcePolicy'
+              - 'secretsmanager:DeleteSecret'
+              - 'secretsmanager:DescribeSecret'
+              - 'secretsmanager:GetResourcePolicy'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:List*'
+              - 'secretsmanager:PutResourcePolicy'
+              - 'secretsmanager:PutSecretValue'
+              - 'secretsmanager:RestoreSecret'
+              - 'secretsmanager:UpdateSecret*'
+              - 'secretsmanager:ValidateResourcePolicy'
+            Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ADOPATSECRET}-*
+            Condition:
+              StringEquals:
+                'secretsmanager:ResourceTag/Owner': !Ref Owner
+          -
+            Principal: "*"
+            Effect: "Deny"
+            Action: 
+              - 'secretsmanager:CreateSecret'
+              - 'secretsmanager:DeleteResourcePolicy'
+              - 'secretsmanager:DeleteSecret'
+              - 'secretsmanager:DescribeSecret'
+              - 'secretsmanager:GetResourcePolicy'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:PutResourcePolicy'
+              - 'secretsmanager:PutSecretValue'
+              - 'secretsmanager:RestoreSecret'
+              - 'secretsmanager:UpdateSecret*'
+              - 'secretsmanager:ValidateResourcePolicy'
+            Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ADOPATSECRET}-*
+            Condition:
+              ArnNotLike:
+                aws:PrincipalARN:
+                  - !Ref ADMIN
+                  - !GetAtt ADORole.Arn
