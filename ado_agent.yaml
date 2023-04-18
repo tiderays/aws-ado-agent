@@ -26,16 +26,16 @@ Parameters:
     Type: String
     Description: Owner
     Default: First-Last-SE
-  VSTSAgentVersion:
+  ADOAgentVersion:
     Type: String
-    Description: VSTS Agent Version
+    Description: ADO Agent Version
     Default: 2.218.1
-  VSTSAgentPool:
+  ADOAgentPool:
     Type: String
-    Description: VSTS Agent Pool Name
-  VSTSAgentName:
+    Description: ADO Agent Pool Name
+  ADOAgentName:
     Type: String
-    Description: VSTS Agent Name
+    Description: ADO Agent Name
   ADOURL:
     Type: String
     Description: Your ADO Organization URL
@@ -179,7 +179,7 @@ Resources:
             Fn::Sub:
               |
                 #!/bin/bash
-                AGENT_DIR="/opt/vsts-agent"
+                AGENT_DIR="/opt/ado-agent"
 
                 # Python Install
                 yum update -y
@@ -205,8 +205,8 @@ Resources:
                 cd $AGENT_DIR
 
                 # Install Azure DevOps Agent
-                wget https://vstsagentpackage.azureedge.net/agent/${VSTSAgentVersion}/vsts-agent-linux-x64-${VSTSAgentVersion}.tar.gz
-                tar zxvf vsts-agent-linux-x64-${VSTSAgentVersion}.tar.gz
+                wget https://vstsagentpackage.azureedge.net/agent/${ADOAgentVersion}/vsts-agent-linux-x64-${ADOAgentVersion}.tar.gz
+                tar zxvf vsts-agent-linux-x64-${ADOAgentVersion}.tar.gz
                 chown ec2-user . -R
 
                 # Setup .aws config 
@@ -220,7 +220,7 @@ Resources:
                 pat_token=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${ADOPATSECRET} --output text | awk '{ print $4 }' | cut -d: -f2 | tr -d \"})
 
                 echo 'Installing Azure DevOps Agent'
-                su ec2-user -c "sh config.sh --unattended --url ${ADOURL} --auth pat --token $pat_token --pool ${VSTSAgentPool} --agent ${VSTSAgentName} --replace True --acceptTeeEula True"
+                su ec2-user -c "sh config.sh --unattended --url ${ADOURL} --auth pat --token $pat_token --pool ${ADOAgentPool} --agent ${ADOAgentName} --replace True --acceptTeeEula True"
                 unset pat_token
                 sudo ./svc.sh install ec2-user
                 sudo ./svc.sh start
